@@ -1,0 +1,58 @@
+name: aiops-diamond
+
+topology:
+  nodes:
+    h1:
+      kind: linux
+      image: aiops-multitool:latest
+      exec:
+        - ip addr add 10.0.1.10/24 dev eth1
+        - ip route del default dev eth0
+        - ip route add default via 10.0.1.1 dev eth1
+
+    r1:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - r1-frr.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+
+    r2:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - r2-frr.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+
+    r3:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - r3-frr.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+
+    r4:
+      kind: linux
+      image: frrouting/frr:latest
+      binds:
+        - r4-frr.conf:/etc/frr/frr.conf
+        - daemons:/etc/frr/daemons
+
+    h2:
+      kind: linux
+      image: aiops-multitool:latest
+      exec:
+        - ip addr add 10.0.2.10/24 dev eth1
+        - ip route del default dev eth0
+        - ip route add default via 10.0.2.1 dev eth1
+
+  links:
+    # Host to routers
+    - endpoints: ["h1:eth1", "r1:eth1"]
+    - endpoints: ["h2:eth1", "r4:eth1"]
+
+    # Diamond: R1 -> R2 -> R4 and R1 -> R3 -> R4
+    - endpoints: ["r1:eth2", "r2:eth1"]
+    - endpoints: ["r1:eth3", "r3:eth1"]
+    - endpoints: ["r2:eth2", "r4:eth2"]
+    - endpoints: ["r3:eth2", "r4:eth3"]

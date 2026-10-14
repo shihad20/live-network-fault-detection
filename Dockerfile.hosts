@@ -1,0 +1,6 @@
+FROM praqma/network-multitool:latest
+
+# iperf3 isn't reliably present in this image, so bake it in at build time,
+# while we still have normal internet access (before the host ever joins
+# the isolated diamond lab network).
+RUN apk add --no-cache iperf3

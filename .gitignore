@@ -1,0 +1,31 @@
+# Local Python environments
+/aiops-env/
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+
+# Containerlab-generated state (contains a generated private CA key)
+/clab-aiops-diamond/
+
+# Per-run collector copies bake in local absolute paths; keep source scripts
+/dataset_runs/**/telemetry_collector.sh
+/dataset_runs/**/link_state_collector.sh
+/dataset_runs/**/inject_faults.sh
+/dataset_runs/**/rtt_burst_collector.sh
+/dataset_runs/**/throughput_collector.sh
+
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime logs and temporary files
+*.log
+*.pid
+
+# Local backup copies; use Git history for source revisions
+*.bak
+*.before_interval_fix

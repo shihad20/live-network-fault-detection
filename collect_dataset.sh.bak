@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Collect isolated, labeled AIOps experiments with counters, link state,
+# burst-ping RTT/loss, and a dedicated iperf3 throughput flow.
+# Usage: bash collect_dataset.sh [number_of_runs]
+# Each run has a unique folder under dataset_runs/; previous CSVs are untouched.
+set -uo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DATA_ROOT="$ROOT/dataset_runs"
+RUNS="${1:-1}"
+BASELINE_SECONDS="${BASELINE_SECONDS:-60}"
+IPERF_PORT=5202
+collector_pids=()
+active_server_pidfile=""
+active_client_pidfile=""
+active_client_log=""
+
+if [[ ! "$RUNS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Usage: bash collect_dataset.sh [positive_number_of_runs]" >&2
+  exit 2
+fi
+if [[ ! "$BASELINE_SECONDS" =~ ^[0-9]+$ ]]; then
+  echo "BASELINE_SECONDS must be a nonnegative integer." >&2
+  exit 2
+fi
+
+for file in telemetry_collect_enhanced_v2.sh link_state_collect_v2.sh inject_faults_enhanced_v2.sh; do
+  if [[ ! -f "$ROOT/$file" ]]; then
+    echo "Missing required script: $ROOT/$file" >&2
+    exit 1
+  fi
+done
+
+for node in h1 h2 r1 r2 r3 r4; do
+  if [[ "$(docker inspect -f '{{.State.Running}}' "clab-aiops-diamond-$node" 2>/dev/null)" != "true" ]]; then
+    echo "Container clab-aiops-diamond-$node is not running. Start the lab first." >&2
+    exit 1
+  fi
+done
+
+if ! docker exec clab-aiops-diamond-h1 ping -n -c 1 -W 2 10.0.2.10 >/dev/null 2>&1; then
+  echo "h1 cannot reach h2. Restore/check the lab before collecting data." >&2
+  exit 1
+fi
+if ! docker exec clab-aiops-diamond-h1 iperf3 --version >/dev/null 2>&1 \
+  || ! docker exec clab-aiops-diamond-h2 iperf3 --version >/dev/null 2>&1; then
+  echo "iperf3 is missing from h1 or h2. Build/deploy the aiops-multitool image first." >&2
+  exit 1
+fi
+
+for router in r2 r3; do
+  qdisc="$(docker exec "clab-aiops-diamond-$router" tc qdisc show dev eth2 2>/dev/null || true)"
+  if [[ "$qdisc" != *"qdisc noqueue"* ]]; then
+    echo "$router eth2 does not have a clean noqueue root qdisc. Inspect it before running faults:" >&2
+    echo "$qdisc" >&2
+    exit 1
+  fi
+done
+
+mkdir -p "$DATA_ROOT"
+stop_collectors() {
+  local pid
+  for pid in "${collector_pids[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${collector_pids[@]:-}"; do wait "$pid" 2>/dev/null || true; done
+  collector_pids=()
+}
+stop_iperf() {
+  if [[ -n "$active_client_pidfile" ]]; then
+    docker exec clab-aiops-diamond-h1 sh -c \
+      'if [ -s "$1" ]; then kill "$(cat "$1")" 2>/dev/null || true; rm -f "$1"; fi' sh "$active_client_pidfile" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$active_server_pidfile" ]]; then
+    docker exec clab-aiops-diamond-h2 sh -c \
+      'if [ -s "$1" ]; then kill "$(cat "$1")" 2>/dev/null || true; rm -f "$1"; fi' sh "$active_server_pidfile" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$active_client_log" ]]; then
+    docker exec clab-aiops-diamond-h1 rm -f "$active_client_log" >/dev/null 2>&1 || true
+  fi
+  active_client_pidfile=""
+  active_server_pidfile=""
+  active_client_log=""
+}
+cleanup_lab() {
+  stop_collectors
+  stop_iperf
+  docker exec clab-aiops-diamond-r1 ip link set eth2 up >/dev/null 2>&1 || true
+  docker exec clab-aiops-diamond-r2 tc qdisc del dev eth2 root >/dev/null 2>&1 || true
+  docker exec clab-aiops-diamond-r3 tc qdisc del dev eth2 root >/dev/null 2>&1 || true
+}
+trap cleanup_lab EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+for ((i=1; i<=RUNS; i++)); do
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  run_name="run_$(printf '%03d' "$i")_$stamp"
+  run_dir="$DATA_ROOT/$run_name"
+  mkdir -p "$run_dir"
+  echo "run_id,$run_name" > "$run_dir/run_metadata.csv"
+  echo "started_utc,$(date -u +%FT%TZ)" >> "$run_dir/run_metadata.csv"
+  echo "baseline_seconds,$BASELINE_SECONDS" >> "$run_dir/run_metadata.csv"
+  echo "iperf3_port,$IPERF_PORT" >> "$run_dir/run_metadata.csv"
+
+  sed "s|^OUTFILE=\"telemetry_enhanced_v2.csv\"|OUTFILE=\"$run_dir/telemetry.csv\"|" \
+    "$ROOT/telemetry_collect_enhanced_v2.sh" > "$run_dir/telemetry_collector.sh"
+  sed "s|^OUTFILE=\"link_state_telemetry_v2.csv\"|OUTFILE=\"$run_dir/link_state.csv\"|" \
+    "$ROOT/link_state_collect_v2.sh" > "$run_dir/link_state_collector.sh"
+  sed "s|^LOGFILE=\"faults_log_enhanced_v2.csv\"|LOGFILE=\"$run_dir/faults.csv\"|" \
+    "$ROOT/inject_faults_enhanced_v2.sh" > "$run_dir/inject_faults.sh"
+
+  if ! grep -Fq "OUTFILE=\"$run_dir/telemetry.csv\"" "$run_dir/telemetry_collector.sh" \
+    || ! grep -Fq "OUTFILE=\"$run_dir/link_state.csv\"" "$run_dir/link_state_collector.sh" \
+    || ! grep -Fq "LOGFILE=\"$run_dir/faults.csv\"" "$run_dir/inject_faults.sh"; then
+    echo "Could not create run-specific scripts; stopping to protect existing data." >&2
+    exit 1
+  fi
+
+  cat > "$run_dir/rtt_burst_collector.sh" <<'RTT_SCRIPT'
+#!/usr/bin/env bash
+OUTFILE="$1"
+DEST="10.0.2.10"
+COUNT=5
+INTERVAL=5
+echo "timestamp,source,destination,rtt_avg_ms,rtt_min_ms,rtt_max_ms,packet_loss_pct,status" > "$OUTFILE"
+while true; do
+  timestamp="$(date -u +%FT%TZ)"
+  result="$(docker exec clab-aiops-diamond-h1 ping -n -i 0.2 -c "$COUNT" -W 1 "$DEST" 2>&1 || true)"
+  loss="$(printf '%s\n' "$result" | sed -nE 's/.* ([0-9]+([.][0-9]+)?)% packet loss.*/\1/p' | tail -n 1)"
+  rtt="$(printf '%s\n' "$result" | sed -nE 's/.* = ([0-9.]+)\/([0-9.]+)\/([0-9.]+)\/.*/\1,\2,\3/p' | tail -n 1)"
+  if [[ -n "$rtt" ]]; then IFS=, read -r rtt_min rtt_avg rtt_max <<< "$rtt"; else rtt_min=""; rtt_avg=""; rtt_max=""; fi
+  if [[ -z "$loss" ]]; then loss=""; status="unknown"
+  elif awk -v loss="$loss" 'BEGIN { exit !(loss == 0) }'; then status="ok"
+  elif awk -v loss="$loss" 'BEGIN { exit !(loss >= 100) }'; then status="timeout"
+  else status="packet_loss"; fi
+  echo "$timestamp,h1,$DEST,$rtt_avg,$rtt_min,$rtt_max,$loss,$status" >> "$OUTFILE"
+  sleep "$INTERVAL"
+done
+RTT_SCRIPT
+
+  cat > "$run_dir/throughput_collector.sh" <<'THROUGHPUT_SCRIPT'
+#!/usr/bin/env bash
+OUTFILE="$1"
+CLIENT_LOG="$2"
+INTERVAL=5
+echo "timestamp,source,destination,server_port,throughput_mbps,status" > "$OUTFILE"
+while true; do
+  timestamp="$(date -u +%FT%TZ)"
+  output="$(docker exec clab-aiops-diamond-h1 sh -c 'tail -n 50 "$1" 2>/dev/null || true' sh "$CLIENT_LOG" 2>/dev/null || true)"
+  mbps="$(printf '%s\n' "$output" | awk '
+    $3 == "sec" && $2 ~ /^[0-9.]+-[0-9.]+$/ {
+      for (i=1; i<=NF; i++) if ($i ~ /bits\/sec$/) {
+        value=$(i-1); unit=$i
+        if (unit == "Kbits/sec") value /= 1000
+        else if (unit == "Gbits/sec") value *= 1000
+        else if (unit != "Mbits/sec") continue
+        rate=value
+      }
+    }
+    END { if (rate != "") printf "%.6f", rate }
+  ')"
+  if [[ -n "$mbps" ]]; then status="ok"; else mbps=""; status="no_sample"; fi
+  echo "$(date -u +%FT%TZ),h1,10.0.2.10,5202,$mbps,$status" >> "$OUTFILE"
+  sleep "$INTERVAL"
+done
+THROUGHPUT_SCRIPT
+
+  active_server_pidfile="/tmp/aiops_${run_name}_iperf_server.pid"
+  active_client_pidfile="/tmp/aiops_${run_name}_iperf_client.pid"
+  active_client_log="/tmp/aiops_${run_name}_iperf_client.log"
+  docker exec clab-aiops-diamond-h2 iperf3 -s -D -p "$IPERF_PORT" -I "$active_server_pidfile" > "$run_dir/iperf_server_start.log" 2>&1 || {
+    echo "Could not start the dedicated iperf3 server. Check $run_dir/iperf_server_start.log" >&2
+    exit 1
+  }
+  sleep 1
+  if ! docker exec clab-aiops-diamond-h2 sh -c 'test -s "$1" && kill -0 "$(cat "$1")"' sh "$active_server_pidfile"; then
+    echo "The iperf3 server did not start. Port $IPERF_PORT may already be in use." >&2
+    exit 1
+  fi
+  docker exec clab-aiops-diamond-h1 sh -c \
+    'nohup iperf3 -c 10.0.2.10 -p 5202 -i 1 -t 36000 --forceflush > "$1" 2>&1 & echo $! > "$2"' \
+    sh "$active_client_log" "$active_client_pidfile" || {
+      echo "Could not start the iperf3 client." >&2
+      exit 1
+    }
+  sleep 2
+  if ! docker exec clab-aiops-diamond-h1 sh -c 'test -s "$1" && kill -0 "$(cat "$1")"' sh "$active_client_pidfile"; then
+    echo "The iperf3 client did not stay running. Check $active_client_log in h1." >&2
+    exit 1
+  fi
+
+  bash "$run_dir/telemetry_collector.sh" > "$run_dir/telemetry_collector.log" 2>&1 & collector_pids+=("$!")
+  bash "$run_dir/link_state_collector.sh" > "$run_dir/link_state_collector.log" 2>&1 & collector_pids+=("$!")
+  bash "$run_dir/rtt_burst_collector.sh" "$run_dir/rtt.csv" > "$run_dir/rtt_collector.log" 2>&1 & collector_pids+=("$!")
+  bash "$run_dir/throughput_collector.sh" "$run_dir/throughput.csv" "$active_client_log" > "$run_dir/throughput_collector.log" 2>&1 & collector_pids+=("$!")
+
+  echo "[$i/$RUNS] Collecting a ${BASELINE_SECONDS}s baseline with dedicated iperf3 traffic: $run_dir"
+  sleep "$BASELINE_SECONDS"
+  echo "[$i/$RUNS] Running the four labeled fault injections (about 5.5 minutes)."
+  if ! bash "$run_dir/inject_faults.sh" > "$run_dir/fault_injector.log" 2>&1; then
+    echo "Fault sequence failed for $run_name. Check $run_dir/fault_injector.log" >&2
+    exit 1
+  fi
+  echo "[$i/$RUNS] Collecting post-fault baseline."
+  sleep "$BASELINE_SECONDS"
+  stop_collectors
+  stop_iperf
+
+  for data_file in telemetry.csv link_state.csv rtt.csv throughput.csv faults.csv; do
+    if [[ ! -s "$run_dir/$data_file" ]]; then
+      echo "Missing or empty $data_file in $run_dir; check collector logs." >&2
+      exit 1
+    fi
+  done
+  echo "completed_utc,$(date -u +%FT%TZ)" >> "$run_dir/run_metadata.csv"
+  echo "[$i/$RUNS] Complete: $run_dir"
+done
+
+echo "All $RUNS run(s) complete. Each run is saved separately under $DATA_ROOT."
+echo "Existing telemetry and scored CSV files were not used as outputs."

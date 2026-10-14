@@ -1,0 +1,5 @@
+start_time,end_time,fault_type,location
+2026-10-07T06:51:37Z,2026-10-07T06:52:38Z,link_down,r1-r2
+2026-10-07T06:53:08Z,2026-10-07T06:54:08Z,high_latency,r3-r4
+2026-10-07T06:54:38Z,2026-10-07T06:55:39Z,packet_loss,r3-r4
+2026-10-07T06:56:09Z,2026-10-07T06:57:09Z,congestion,r2 and r3 (both diamond paths throttled)
